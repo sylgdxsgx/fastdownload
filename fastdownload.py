@@ -36,7 +36,7 @@ class Download(object):
         '''返回队列和文件名或文件路径'''
         parsed_result = urlsplit(url)
         if parsed_result.path.split('/')[-1] == 'index.m3u8':
-            queue,fpath = self.producer_m3u8(url)
+            queue,fpath = self.producer_m3u(url)
         else:
             print('无法判断下载文件')
             return False,None
@@ -46,19 +46,19 @@ class Download(object):
         await self.session.close()
         self.new_loop.stop()
 
-    async def convert_m3u8(self,path):
+    async def convert_m3u(self,path):
         '''文件合并'''
         # 从m3u8文件获取小文件
-        m3u8_list = []
+        m3u_list = []
         for root,dirs,files in os.walk(path):
             for file in files:
                 if file.lower().endswith('.m3u8'):
-                    m3u8 = root +'/' + file
-                    m3u8_list.append(m3u8)
-        for file in m3u8_list:  #当前目录下的所有m3u8文件
-            m3u8_path,m3u8_name = os.path.split(file)
-            filename = m3u8_path.split('/')[-1]
-            videofile = m3u8_path+'/'+filename+'.mp4'
+                    m3u = root +'/' + file
+                    m3u_list.append(m3u)
+        for file in m3u_list:  #当前目录下的所有m3u8文件
+            m3u_path,m3u_name = os.path.split(file)
+            filename = m3u_path.split('/')[-1]
+            videofile = m3u_path+'/'+filename+'.mp4'
             ts_list = []
             if os.path.exists(videofile):
                 os.remove(videofile)
@@ -67,7 +67,7 @@ class Download(object):
                 for line in lines:
                     if line[0] != '#' and line[0] != '':
                         ts_name = line.strip().split('/')[-1]
-                        ts_file = m3u8_path+'/'+ts_name
+                        ts_file = m3u_path+'/'+ts_name
                         if os.path.exists(ts_file) and os.path.getsize(ts_file)>0:
                             ts_list.append(ts_file) #获取所有的ts文件
             if ts_list:
@@ -124,7 +124,7 @@ class Download(object):
         # print(self.queue.qsize())
         # 支持断点续传方法二
 
-    def producer_m3u8(self,url):
+    def producer_m3u(self,url):
         queue = asyncio.Queue(loop=self.new_loop)
         parsed_result = urlsplit(url)
         scheme = parsed_result.scheme
@@ -279,7 +279,7 @@ class Download(object):
             self.queue_done.put_nowait(msg)
             if self.success_count[path] == size:
                 self.queue_done.put_nowait('合并文件...')
-                file = await self.convert_m3u8(path)
+                file = await self.convert_m3u(path)
                 self.queue_done.put_nowait('生成文件：%s'%file)
             else:
                 self.queue_done.put_nowait('未下载完成')
