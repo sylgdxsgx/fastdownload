@@ -36,11 +36,11 @@ class Download(object):
         '''返回队列和文件名或文件路径'''
         parsed_result = urlsplit(url)
         if parsed_result.path.split('/')[-1] == 'index.m3u8':
-            queue,fpath = self.producer_m3u(url)
+            queue,done,fpath = self.producer_m3u(url)
         else:
             print('无法判断下载文件')
             return False,None
-        return queue,fpath
+        return queue,done,fpath
 
     async def stop_loop(self):
         await self.session.close()
@@ -57,7 +57,7 @@ class Download(object):
                     m3u_list.append(m3u)
         for file in m3u_list:  #当前目录下的所有m3u8文件
             m3u_path,m3u_name = os.path.split(file)
-            filename = m3u_path.split('/')[-1]
+            filename = m3u_path.replace('\\','/').split('/')[-1]
             videofile = m3u_path+'/'+filename+'.mp4'
             ts_list = []
             if os.path.exists(videofile):
@@ -131,12 +131,14 @@ class Download(object):
         netloc = parsed_result.netloc
         netpath = os.path.split(parsed_result.path)[0]
         file_name = parsed_result.path.split('/')[-1]
+        total = 0	# 文件数量
+        done = 0 	# 完成数量
         try:
             save_path = download_dir+'/'+parsed_result.path.split('/')[-4] if parsed_result.path.split('/')[-4] else file_name
         except:
             save_path = download_dir+'/'+file_name
         # 判断引导文件是否已经下载了
-        if os.path.exists(save_path+'/'+file_name):
+        if os.path.exists(save_path+'/'+file_name) and os.path.getsize(save_path+'/'+file_name)>1024:
             with open(save_path+'/'+file_name,'r') as fd:
                 for line in fd.readlines():
                     if line and line[0] != '#':
@@ -144,6 +146,7 @@ class Download(object):
                         # print(path,file)
                         # 判断是否已经下载了，若是小于5k也会重新下载
                         if os.path.exists(save_path+'/'+file) and  os.path.getsize(save_path+'/'+file) > 5120:
+                            done +=1 # 完成数量+1
                             continue
                         if not path:    #只有文件名时
                             base_url = scheme+'://'+netloc+netpath
@@ -158,9 +161,10 @@ class Download(object):
             for i in range(self.max_tries):
                 try:
                     r = requests.get(url,timeout=20)
-                    with open(save_path+'/'+file_name,'wb') as fd:
+                    with open(save_path+'/'+file_name,'ab') as fd:
+                        fd.write(str.encode('#%s\n'%url))		# 首行保存url 临时处理
                         fd.write(r.content)
-
+                    
                     for data in r.text.split('\n'):
                         if data != '' and data[0] !='#':
                             path,file = os.path.split(data)
@@ -176,15 +180,16 @@ class Download(object):
                     pass
             else:
                 print('%-15s 下载失败'%save_path.split('/')[-1])
-                return queue,save_path
+                return queue,done,save_path
         if not queue.qsize():
             print('%-15s 下载完毕'%save_path.split('/')[-1])
         else:
             print('%-15s 准备下载...'%save_path.split('/')[-1])
             self.files.append(save_path)
-        self.total += queue.qsize()         # 下载总数增加
-        self.success_count[save_path] = 0   # 初始化下载成功数量
-        return queue,save_path
+        self.total += done + queue.qsize()         # 下载总数增加
+        self.success_count[save_path] = done   # 初始化当前文件的下载成功数量
+        self.done += done 	# 初始化总完成数量
+        return queue,done,save_path
 
     async def consumer(self,queue):
         while True:
@@ -323,9 +328,9 @@ class Download(object):
         sub_workers = []
         self.start_thread()
         for url in self.urls:
-            queue,fpath = self.check_url(url)
+            queue,done,fpath = self.check_url(url)
             if queue and queue.qsize():
-                size = queue.qsize()
+                size = queue.qsize() + done
                 sub_workers += [asyncio.run_coroutine_threadsafe(self.consumer(queue),self.new_loop) for _ in range(self.max_tasks)]
                 # for _ in range(self.max_tasks):
                 #     task = asyncio.run_coroutine_threadsafe(self.consumer(queue),self.new_loop)
@@ -375,7 +380,7 @@ class ShowProcess():
     # 效果为[>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>]100.00%
     def show_process(self, i=None,size=0):
         if self.i >= self.max_steps:
-            # self.finish()
+            self.finish()
             return
         end_time = time.time()
         if i is not None:
@@ -414,7 +419,7 @@ class ShowProcess():
             return "%.2fKb/s"%kb
 
     def finish(self):
-        print('')
+        print('\n')
         # print(self.infoDone)
         self.i = 0
 
