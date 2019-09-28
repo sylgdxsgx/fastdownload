@@ -5,11 +5,7 @@ from progressbar import *
 from queue import Queue
 from urllib.parse import urlsplit
  
-urls = [
-'https://youku.com-y-youku.com/20190816/6287_65cb2004/1000k/hls/index.m3u8',
-]
-
-download_dir = r'C:\Users\Administrator\AppData\Roaming\myDownload'
+download_dir = os.path.expanduser('~/AppData/Roaming/myDownload')
 os.makedirs(download_dir,exist_ok=True)
 
 class Download(object):
@@ -424,7 +420,9 @@ class ShowProcess():
 
 
 if __name__ == '__main__':
-    loop = asyncio.get_event_loop()
-
-    Dl = Download(loop=loop,urls=urls)
-    Dl.run()
+	if len(sys.argv)<=1:
+		print('Usage: python fastdawnload.py xxx ...')
+	else:
+	    loop = asyncio.get_event_loop()
+	    Dl = Download(loop=loop,urls=sys.argv[1:])
+	    Dl.run()
