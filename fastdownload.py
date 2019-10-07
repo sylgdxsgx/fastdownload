@@ -3,19 +3,30 @@
 import os,asyncio,aiohttp,aiofiles,threading,time,requests,sys
 from progressbar import *
 from queue import Queue
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit,unquote
+from bs4 import BeautifulSoup
+
  
 download_dir = os.path.expanduser('~/AppData/Roaming/myDownload')
 os.makedirs(download_dir,exist_ok=True)
 
+# from selenium import webdriver
+# from selenium.webdriver.Chrome.options import Options
+from selenium.webdriver import Chrome
+from selenium.webdriver import ChromeOptions
+from selenium.webdriver.support.wait import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.by import By
+
+
 class Download(object):
-    def __init__(self,loop,urls,max_tasks=32):
+    def __init__(self,urls=[],max_tasks=32):
         self.urls = urls
         self.headers = {}
         self.max_tasks = max_tasks
-        self.max_tries = 3
+        self.max_tries = 5
         self.new_loop = asyncio.new_event_loop()
-        self.loop = loop
+        self.loop = asyncio.get_event_loop()
         self.session = aiohttp.ClientSession(loop=self.new_loop)
         self.queue_done = asyncio.Queue(loop=self.new_loop)
         self.total = 0  #下载总数
@@ -23,6 +34,12 @@ class Download(object):
         self.files = []  #保存要下载的文件
         self.success_count = {} #每个大文件中，小文件的完成计数
         self.total_size = 0 #文件总大小
+        self.start_rate = False
+        self.start_event = False
+
+        self.sub_workers = []
+        self.start_thread()
+        
 
     def start_thread(self):
         t = threading.Thread(target=self.start_loop,args=(self.new_loop,))
@@ -34,6 +51,7 @@ class Download(object):
 
     def check_url(self,url):
         '''返回队列和文件名或文件路径'''
+        url = unquote(url)
         parsed_result = urlsplit(url)
         if parsed_result.path.split('/')[-1] == 'index.m3u8':
             queue,done,fpath = self.producer_m3u(url)
@@ -130,15 +148,12 @@ class Download(object):
         scheme = parsed_result.scheme
         netloc = parsed_result.netloc
         netpath = os.path.split(parsed_result.path)[0]
-        file_name = parsed_result.path.split('/')[-1]
+        file_name = os.path.split(parsed_result.path)[1]
         total = 0	# 文件数量
         done = 0 	# 完成数量
-        try:
-            save_path = download_dir+'/'+parsed_result.path.split('/')[-4] if parsed_result.path.split('/')[-4] else file_name
-        except:
-            save_path = download_dir+'/'+file_name
+        save_path = download_dir + '/' + netpath.replace('/','')
         # 判断引导文件是否已经下载了
-        if os.path.exists(save_path+'/'+file_name) and os.path.getsize(save_path+'/'+file_name)>1024:
+        if os.path.exists(save_path+'/'+file_name) and os.path.getsize(save_path+'/'+file_name)>5120:
             with open(save_path+'/'+file_name,'r') as fd:
                 for line in fd.readlines():
                     if line and line[0] != '#':
@@ -164,7 +179,7 @@ class Download(object):
                     with open(save_path+'/'+file_name,'ab') as fd:
                         fd.write(str.encode('#%s\n'%url))		# 首行保存url 临时处理
                         fd.write(r.content)
-                    
+
                     for data in r.text.split('\n'):
                         if data != '' and data[0] !='#':
                             path,file = os.path.split(data)
@@ -324,10 +339,21 @@ class Download(object):
         result = future.result()
         print(result)
 
-    def run(self):
+    def get_rate():
+    	if not self.start_rate:
+    		self.start_rate = True
+    		self.sub_workers.append(asyncio.run_coroutine_threadsafe(self.rate(),self.new_loop)) # 总进度
+
+
+    def get_task(self,urls):
+        if not urls:
+            return
         sub_workers = []
-        self.start_thread()
-        for url in self.urls:
+        # self.start_thread()
+        for url in urls:
+            if url in self.urls:
+        	    continue
+            self.urls.append(url)
             queue,done,fpath = self.check_url(url)
             if queue and queue.qsize():
                 size = queue.qsize() + done
@@ -337,11 +363,20 @@ class Download(object):
                 #     task.add_done_callback(self.get_result)
                 #     sub_workers.append(task)
                 sub_workers.append(asyncio.run_coroutine_threadsafe(self.check_done(queue,fpath,size),self.new_loop))
-        
-        sub_workers.append(asyncio.run_coroutine_threadsafe(self.rate(),self.new_loop)) # 总进度
-        sub_workers = [asyncio.wrap_future(worker,loop=self.loop) for worker in sub_workers]
+        if not self.start_rate:
+            sub_workers.append(asyncio.run_coroutine_threadsafe(self.rate(),self.new_loop)) # 总进度
+            self.start_rate = True
+        self.sub_workers += [asyncio.wrap_future(worker,loop=self.loop) for worker in sub_workers]
+
+        # self.get_rate()
+        self.run()
+
+    def run(self):
+        if self.start_event:
+            return
+        self.start_event = True
         try:
-            self.loop.run_until_complete(asyncio.wait(sub_workers)) #等待协程执行完成
+            self.loop.run_until_complete(asyncio.wait(self.sub_workers)) #等待协程执行完成
             # 因为协程已经自动关闭了，所以不用手动关闭协程了
             # for worker in sub_workers:
             #     print(worker)
@@ -360,6 +395,45 @@ class Download(object):
         # 关闭session和事件循环,已经主线程的事件循环
         asyncio.run_coroutine_threadsafe(self.stop_loop(),self.new_loop)
         self.loop.close()
+
+class CheckUrl():
+	def __init__(self,urls=[]):
+		self.urls = urls
+		self.rs = requests.session()
+		option = ChromeOptions()
+		option.add_argument('--headless')
+		self.driver = Chrome(chrome_options=option)
+
+	def get_task(self,urls):
+		if not urls:
+			return
+		for url in urls:
+			if url in self.urls:
+				continue
+			self.urls.append(url)
+			print('start selenium')
+			self.driver.get(url)
+			tag = (By.ID,"playerBox")
+			WebDriverWait(self.driver,30,0.5).until(EC.element_to_be_clickable(tag)) 
+			soup = BeautifulSoup(self.driver.page_source,'lxml')
+			self.driver.close()
+			print('end selenium')
+			video = soup.find('div',class_='video-detail')
+			video_name = video.find('div',class_='video-name').h3.string
+			print(video_name)
+			# video_frame = video[0].find_all('div',class_='video-frame')
+			# print(video_frame)
+			param = video.find('embed')['flashvars']
+			params = urllib.unquote(param).split('&')
+			for param in params:
+				print(param)
+
+
+		self.driver.quit()
+		print('end')
+
+
+
 
 class ShowProcess():
     """
@@ -423,11 +497,29 @@ class ShowProcess():
         # print(self.infoDone)
         self.i = 0
 
+def main(urls):
+	durl = []
+	curl = []
+	for url in urls:
+		url = unquote(url)
+		parsed_result = urlsplit(url)
+		file_name = os.path.split(parsed_result.path)[1]
+		if file_name == 'index.m3u8' :
+			durl.append(url)
+		else:
+			curl.append(url)
+	Dl.get_task(durl)
+	Cu.get_task(curl)
+
+
 
 if __name__ == '__main__':
 	if len(sys.argv)<=1:
 		print('Usage: python fastdawnload.py xxx ...')
 	else:
-	    loop = asyncio.get_event_loop()
-	    Dl = Download(loop=loop,urls=sys.argv[1:])
-	    Dl.run()
+		# urls = CheckUrl(urls=sys.argv[1:])
+		# urls.getUrl()
+	    # loop = asyncio.get_event_loop()
+	    Dl = Download()
+	    Cu = CheckUrl()
+	    main(urls=sys.argv[1:])

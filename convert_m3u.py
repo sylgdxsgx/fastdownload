@@ -1,4 +1,4 @@
-'''绝对路径为变量'''
+'''用法：python convert_m3u.py path'''
 import sys,os
 def convert_m3u(path):
     '''文件合并'''
