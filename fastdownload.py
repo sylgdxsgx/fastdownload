@@ -21,7 +21,7 @@ from selenium.webdriver.common.by import By
 
 
 class Download(object):
-	def __init__(self,urls=[],max_tasks=32):
+	def __init__(self,urls=[],max_tasks=16):
 		self.urls = urls
 		self.headers = {}
 		self.max_tasks = max_tasks
@@ -30,7 +30,6 @@ class Download(object):
 		self.loop = asyncio.get_event_loop()
 		self.session = aiohttp.ClientSession(loop=self.new_loop)
 		self.queue_done = asyncio.Queue(loop=self.new_loop)
-		self.files = []  #保存要下载的文件
 		self.total_chunk = 0  #下载总块数
 		self.total_size = 0 #文件总字节大小
 		self.done_chunk = 0   #下载完成块数
@@ -162,6 +161,7 @@ class Download(object):
 	def producer_http(self,url):
 		requests.packages.urllib3.disable_warnings()
 		r = self.rs.get(url,stream=True,verify=False)
+		url = r.url
 		# print(r.headers)
 		# print(r.status_code)
 		
@@ -216,8 +216,8 @@ class Download(object):
 			save_path = download_dir+'/'+time_stamp
 			self.cfg.add_section(time_stamp)
 			self.cfg.set(time_stamp,'success',str(0))
-			# self.cfg.set(time_stamp,'total',str(0))
-			# self.cfg.set(time_stamp,'done',str(0))
+			self.cfg.set(time_stamp,'total',str(0))
+			self.cfg.set(time_stamp,'done',str(0))
 			self.cfg.set(time_stamp,'url',quote(url))
 			self.cfg.set(time_stamp,'protocol',scheme)
 			self.cfg.set(time_stamp,'name',file_name)
@@ -257,27 +257,29 @@ class Download(object):
 				tmp_done = 0
 
 			# 判断文件是否下载完成
-			if os.path.exists(save_path+'/'+str(start_byte)) and os.path.getsize(save_path+'/'+str(start_byte))>=tmp_size:	#要大于
+			chunk_file = save_path+'/'+str(start_byte)
+			if os.path.exists(chunk_file) and os.path.getsize(chunk_file)>=tmp_size:	#要大于
 				done += 1
-				done_length += os.path.getsize(save_path+'/'+str(start_byte))
+				done_length += os.path.getsize(chunk_file)
 				start_byte = next_byte
 				continue
-			if os.path.exists(save_path+'/'+str(start_byte)):	# 如果未下载完成，则修改请求头继续下载
-				tmp_done = os.path.getsize(save_path+'/'+str(start_byte))
+			if os.path.exists(chunk_file):	# 如果未下载完成，则修改请求头继续下载
+				tmp_done = os.path.getsize(chunk_file)
 				done_length += tmp_done
 				tmp_start = tmp_start + tmp_done
 			queue.put_nowait({'section':section,'ftype':'http','file_name':str(start_byte),'save_path':save_path,'url':url,'start':tmp_start,'end':tmp_end,'done':tmp_done,'size':tmp_size,'Amount':0})
 			start_byte = next_byte
-		self.files.append(section)
 		total = done+queue.qsize()
 		self.cfg.set(section,'total',str(total))
 		self.cfg.set(section,'done',str(done))
 		self.cfg.set(section,'done_length',str(done_length))
 		self.cfg.write(open(self.conf,'w'))
 		self.download_progress[section] = {'total':total,'done':done,'content_length':Content_Length,'done_length':done_length}
-		self.total_chunk += done + queue.qsize()
+		self.total_chunk += total
 		self.done_chunk += done
-		return queue,done,section
+		self.total_size += Content_Length
+		self.done_size += done_length
+		return queue,section
 	
 
 	def producer_m3u(self,url):
@@ -342,8 +344,8 @@ class Download(object):
 						section = str(section)
 						self.cfg.add_section(time_stamp)
 						self.cfg.set(time_stamp,'success',str(0))
-						# self.cfg.set(time_stamp,'total',str(0))
-						# self.cfg.set(time_stamp,'done',str(0))
+						self.cfg.set(time_stamp,'total',str(0))
+						self.cfg.set(time_stamp,'done',str(0))
 						self.cfg.set(time_stamp,'url',quote(url))
 						self.cfg.set(time_stamp,'protocol',scheme)
 						self.cfg.set(time_stamp,'name',file_name)
@@ -373,7 +375,6 @@ class Download(object):
 			print('%-15s 下载完毕'%save_path.split('/')[-1])
 		else:
 			print('%-15s 准备下载...'%save_path.split('/')[-1])
-			self.files.append(section)
 		total = done + queue.qsize()
 		self.cfg.set(section,'total',str(total))
 		self.cfg.set(section,'done',str(done))
@@ -382,24 +383,27 @@ class Download(object):
 		self.download_progress[section] = {'total':total,'done':done,'content_length':0,'done_length':0}
 		self.total_chunk += total		 # 下载总数增加
 		self.done_chunk += done 	# 初始化总完成数量
-		return queue,done,section
+		self.total_size += 0
+		self.done_size += 0
+		return queue,section
 
-	async def consumer(self,queue):
-		while True:
-			if queue.empty():
-				return True
-			try:
-				key = await queue.get()
-				key = await self.download(key)
-				if key:
-					self.done_chunk +=1		# 下载总完成数增加
-					self.download_progress[key['section']]['done'] += 1	#下载总块数增加
-					
-				queue.task_done()   # 用来触发check_done
-			except asyncio.CancelledError:
-				raise
-			except Exception as e:
-				pass
+	async def consumer(self,queue,semaphore):
+		async with semaphore:		#这里进行执行asyncio.Semaphore，
+			while True:
+				if queue.empty():
+					return True
+				try:
+					key = await queue.get()
+					key = await self.download(key)
+					if key:
+						self.done_chunk +=1		# 下载总完成kuai数增加
+						self.download_progress[key['section']]['done'] += 1	#当前文件下载块数增加
+
+					queue.task_done()   # 用来触发check_done
+				except asyncio.CancelledError:
+					raise
+				except Exception as e:
+					pass
 
 	async def download(self,key):
 		'''返回文件大小和文件路径'''
@@ -414,7 +418,8 @@ class Download(object):
 					async with self.session.get(url,timeout=10) as resp:
 						async with aiofiles.open(file_path,'wb') as fd:
 							await fd.write(await resp.read())
-					self.total_size += os.path.getsize(file_path)	 #下载字节数增加
+					self.done_size += os.path.getsize(file_path)	 #下载字节数增加
+					self.download_progress[key['section']]['done_length'] += os.path.getsize(file_path)
 					
 					return key
 				except asyncio.CancelledError:
@@ -427,16 +432,16 @@ class Download(object):
 			file_name = key['file_name']
 			file_path = key['save_path'] + '/' + key['file_name']
 			url = key['url']
-			status = True
+
 			while True:
 				if key['Amount'] >= self.max_tries:
 					return False
 				try:
 					headers = {'Range': 'bytes=%s-%s'%(key['start'],key['end'])}
-					async with self.session.get(url,headers=headers,timeout=10) as resp:
+					async with self.session.get(url,headers=headers,timeout=5) as resp:
 						async with aiofiles.open(file_path,'ab') as fd:
 							while True:
-								data = await resp.content.read(204800) 	#每次最多寫入20k
+								data = await resp.content.read(20480) 	#每次最多寫入20k
 								status = resp.status
 								if status not in (200,206):
 									key['Amount'] +=1
@@ -444,8 +449,7 @@ class Download(object):
 								if not data:
 									break
 								await fd.write(data)
-								self.total_size += len(data)	# 下载总字节数增加
-
+								self.done_size += len(data)	# 下载总字节数增加
 								self.download_progress[key['section']]['done_length'] += len(data)	#下载字节数增加
 								
 				except asyncio.CancelledError:
@@ -460,13 +464,12 @@ class Download(object):
 						tmp_size = os.path.getsize(file_path)
 						if tmp_size > key['done']:		# 表示又下载了部分
 							key['start'] += tmp_size - key['done']	# 更新key['start']
-							key['done'] += tmp_size
+							key['done'] = tmp_size
 						else:
 							key['Amount'] +=1
 							
 				if os.path.exists(file_path) and os.path.getsize(file_path)>=key['size']:
 					return key
-		return False
 		
 	async def check_done(self,queue,section):
 		'''下载完成发消息'''
@@ -489,26 +492,25 @@ class Download(object):
 			print('err')
 			raise
 			pass
-		self.files.remove(section) #删除已下载结束的文件
+		self.download_progress.pop(section)	# 删除已下载结束的renwu
 
 	async def rate(self):
 		'''下载进度统计'''
-		widgets = ['Progress: ', Percentage(), ' ', Bar(marker=RotatingMarker('#')),' ',SimpleProgress(),
-		   ' ', ETA(), ' ', FileTransferSpeed()]
+		# widgets = ['Progress: ', Percentage(), ' ', Bar(marker=RotatingMarker('#')),' ',SimpleProgress(),
+		#    ' ', ETA(), ' ', FileTransferSpeed()]
 		# pbar = ProgressBar(widgets=widgets, maxval=self.total).start()
 		pbar = ShowProcess(self.total_chunk)
-		# pbar = ShowProcess(self.download_progress)
 		try:
 			while True:
 				if not self.total_chunk:
 					break
-				rlt = pbar.show_process(self.done_chunk,self.total_size)
+				rlt = pbar.show_process(self.done_chunk,self.done_size)
+				# rlt = pbar.show_processes(self.download_progress)
 				if rlt:
 					break
-				# pbar.show_processes(self.download_progress)
 				# pbar.update(self.done_chunk)
-				if self.files:
-					await asyncio.sleep(1)
+				if self.download_progress:
+					await asyncio.sleep(2)
 					continue
 				# pbar.finish()
 				# await asyncio.sleep(10)
@@ -551,13 +553,14 @@ class Download(object):
 				print(param)
 
 	def get_http_task(self,urls):
+		semaphore = asyncio.Semaphore(500)		 # 限制并发量为500,这里windows需要进行并发限制
 		if not urls:
 			return
 		sub_workers=[]
 		for url in urls:
-			queue,done,section = self.producer_http(url)
+			queue,section = self.producer_http(url)
 			if queue and queue.qsize():
-				sub_workers +=[asyncio.run_coroutine_threadsafe(self.consumer(queue),self.new_loop) for _ in range(self.max_tasks)]
+				sub_workers +=[asyncio.run_coroutine_threadsafe(self.consumer(queue,semaphore),self.new_loop) for _ in range(self.max_tasks)]
 				sub_workers.append(asyncio.run_coroutine_threadsafe(self.check_done(queue,section),self.new_loop))
 		if not self.start_rate:
 			sub_workers.append(asyncio.run_coroutine_threadsafe(self.rate(),self.new_loop)) # 总进度
@@ -567,13 +570,14 @@ class Download(object):
 		self.run()
 
 	def get_m3u_task(self,urls):
+		semaphore = asyncio.Semaphore(500)		 # 限制并发量为500,这里windows需要进行并发限制
 		if not urls:
 			return
 		sub_workers = []
 		for url in urls:
-			queue,done,section = self.producer_m3u(url)
+			queue,section = self.producer_m3u(url)
 			if queue and queue.qsize():
-				sub_workers += [asyncio.run_coroutine_threadsafe(self.consumer(queue),self.new_loop) for _ in range(self.max_tasks)]
+				sub_workers += [asyncio.run_coroutine_threadsafe(self.consumer(queue,semaphore),self.new_loop) for _ in range(self.max_tasks)]
 				# for _ in range(self.max_tasks):
 				#	 task = asyncio.run_coroutine_threadsafe(self.consumer(queue),self.new_loop)
 				#	 task.add_done_callback(self.get_result)
@@ -627,13 +631,14 @@ class ShowProcess():
 		self.infoDone = infoDone
 		self.size = 0
 		self.start_time = time.time()
+		self.total = 0
+		self.done = 0
 
 	# 显示函数，根据当前的处理进度i显示进度
 	# 效果为[>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>]100.00%
 	def show_process(self, i=None,size=0):
 		if self.i >= self.max_steps:
-			self.finish()
-			return True
+			return self.finish()
 		end_time = time.time()
 		if i is not None:
 			self.i = i
@@ -643,7 +648,7 @@ class ShowProcess():
 			speed = (size - self.size)/(end_time - self.start_time)
 		except:
 			speed = 0
-		speed_str = " Speed: %-10s"%self.format_size(speed)
+		speed_str = " Speed: %-12s"%self.format_size(speed)
 		self.size = size
 		self.start_time = end_time
 		num_arrow = int(self.i * self.max_arrow / self.max_steps) #计算显示多少个'#'
@@ -655,22 +660,28 @@ class ShowProcess():
 		
 	def show_processes(self,d):
 		end_time = time.time()
-		process_bar = ''
+		total_size = 0
+		done_size = 0
 		for section,value in d.items():
-			try:
-				speed = (value['done'] - self.processes[section]['done'])/(end_time - self.start_time)
-			except:
-				speed = 0
-			speed_str = " Speed: %-10s"%self.format_size(speed)
-			num_arrow = int(value['done'] * self.max_arrow / value['total']) #计算显示多少个'#'
-			num_line = self.max_arrow - num_arrow #计算显示多少个' '
-			percent = value['done'] * 100.0 / value['total'] #计算完成进度，格式为xx.xx%
-			process_bar += '[' + '#' * num_arrow + ' ' * num_line + ']' + ' %s/%s %7.2f%% ' %(value['done'],value['total'],percent) + speed_str	+'\r\n' # + '\r' #带输出的字符串，'\r'表示不换行回到最左边
+			total_size += value['content_length']
+			done_size += value['done_length']
+		try:
+			speed = (done_size - self.done)/(end_time - self.start_time)
+		except:
+			speed = 0
+		speed_str = " Speed: %-12s"%self.format_size(speed)
+		num_arrow = int(done_size * self.max_arrow / total_size) #计算显示多少个'#'
+		num_line = self.max_arrow - num_arrow #计算显示多少个' '
+		percent = done_size * 100.0 / total_size #计算完成进度，格式为xx.xx%
+		process_bar = '[' + '#' * num_arrow + ' ' * num_line + ']' + ' %s/%s %7.2f%% ' %(done_size,total_size,percent) + speed_str	+'\r' # + '\r' #带输出的字符串，'\r'表示不换行回到最左边
 
-		self.processes = d
+		self.total = total_size
+		self.done = done_size
 		self.start_time = end_time
 		sys.stdout.write(process_bar)
 		sys.stdout.flush()
+		if done_size >= total_size:
+			return self.finish()
 	
 	def format_size(self,b):
 		try:
@@ -689,9 +700,10 @@ class ShowProcess():
 			return "%.2fKb/s"%kb
 
 	def finish(self):
-		print('\n')
+		print('\n\n')
 		# print(self.infoDone)
 		self.i = 0
+		return True
 
 
 
