@@ -9,10 +9,12 @@ def convert_m3u(path):
             if file.lower().endswith('.m3u8'):
                 m3u = root +'/' + file
                 m3u_list.append(m3u)
+
     for file in m3u_list:  #当前目录下的所有m3u8文件
         m3u_path,m3u_name = os.path.split(file)
         filename = m3u_path.replace('\\','/').split('/')[-1]
-        videofile = m3u_path+'/'+filename+'.mp4'
+        videofile = '/'.join(m3u_path.split('\\')[:-1])+'/'+filename+'.mp4'
+        # videofile = m3u_path+'/'+filename+'.mp4'
         ts_list = []
         if os.path.exists(videofile):
             os.remove(videofile)
