@@ -66,6 +66,7 @@ class Download(object):
 		t.start()
 
 	def start_loop(self,loop):
+		print('线程开启 tid:',threading.currentThread().ident)
 		asyncio.set_event_loop(loop)
 		loop.run_forever()
 
