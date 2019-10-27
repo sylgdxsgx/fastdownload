@@ -62,6 +62,7 @@ class Download(object):
 
 	def start_thread(self):
 		t = threading.Thread(target=self.start_loop,args=(self.new_loop,))
+		t.setDaemon(True)    # 设置子线程为守护线程,即主线程退出时，子线程也会跟着退出
 		t.start()
 
 	def start_loop(self,loop):
@@ -389,16 +390,19 @@ class Download(object):
 
 	async def consumer(self,queue,semaphore):
 		async with semaphore:		#这里进行执行asyncio.Semaphore，
+			section = None
 			while True:
 				if queue.empty():
-					return True
+					return section
 				try:
 					key = await queue.get()
 					key = await self.download(key)
 					if key:
 						self.done_chunk +=1		# 下载总完成kuai数增加
 						self.download_progress[key['section']]['done'] += 1	#当前文件下载块数增加
-
+					else:
+						print(key['file_name'],'下载失败\n')
+					section = key['section']
 					queue.task_done()   # 用来触发check_done
 				except asyncio.CancelledError:
 					raise
@@ -412,21 +416,23 @@ class Download(object):
 			file_name = key['file_name']
 			file_path = key['save_path'] + '/' + key['file_name']
 			url = key['base_url'] + '/' + file_name
-			# print(url)
+			# print(key,url)
 			for i in range(self.max_tries):
 				try:
-					async with self.session.get(url,timeout=10) as resp:
+					async with self.session.get(url,timeout=5) as resp:
 						async with aiofiles.open(file_path,'wb') as fd:
 							await fd.write(await resp.read())
 					self.done_size += os.path.getsize(file_path)	 #下载字节数增加
 					self.download_progress[key['section']]['done_length'] += os.path.getsize(file_path)
-					
+					# print('下载完成%s'%key['file_name'])
 					return key
 				except asyncio.CancelledError:
+					print('error')
 					raise
 				except Exception as e:
 					# 会有下载失败的情况
 					pass
+			return False
 			
 		elif key['ftype'] == 'http':
 			file_name = key['file_name']
@@ -523,9 +529,28 @@ class Download(object):
 		except Exception:
 			pass
 
-	def get_result(self,future):
+	async def get_result(self,future):
 		result = future.result()
-		print(result)
+		section = result
+		try:
+			path = self.cfg.get(section,'save_path') + '/' + self.cfg.get(section,'name')
+			msg = '\r任务结束：{:<15s} | ({}/{}) {:.2%}'.format(path,self.download_progress[section]['done'],self.download_progress[section]['total'],self.download_progress[section]['done']/self.download_progress[section]['total'])
+			self.queue_done.put_nowait(msg)
+			if self.download_progress[section]['done'] == self.download_progress[section]['total']:	# 下载完成
+				self.cfg.set(section,'success',"1")
+				self.cfg.write(open(self.conf,'w'))	# 下载完成写入文件
+				self.queue_done.put_nowait('合并文件...')
+				file = await self.convert_m3u(section)
+				self.queue_done.put_nowait('生成文件：%s'%file)
+			else:
+				self.queue_done.put_nowait('未下载完成')
+		except asyncio.CancelledError:
+			raise
+		except Exception:
+			print('err')
+			raise
+			pass
+		self.download_progress.pop(section)	# 删除已下载结束的renwu
 
 	def get_html_task(self,urls):
 		if not urls:
@@ -579,9 +604,9 @@ class Download(object):
 			if queue and queue.qsize():
 				sub_workers += [asyncio.run_coroutine_threadsafe(self.consumer(queue,semaphore),self.new_loop) for _ in range(self.max_tasks)]
 				# for _ in range(self.max_tasks):
-				#	 task = asyncio.run_coroutine_threadsafe(self.consumer(queue),self.new_loop)
-				#	 task.add_done_callback(self.get_result)
-				#	 sub_workers.append(task)
+				# 	 task = asyncio.run_coroutine_threadsafe(self.consumer(queue,semaphore),self.new_loop)
+				# 	 task.add_done_callback(self.get_result)
+				# 	 sub_workers.append(task)
 				sub_workers.append(asyncio.run_coroutine_threadsafe(self.check_done(queue,section),self.new_loop))
 		if not self.start_rate:
 			sub_workers.append(asyncio.run_coroutine_threadsafe(self.rate(),self.new_loop)) # 总进度
