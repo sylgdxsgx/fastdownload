@@ -21,69 +21,74 @@ from selenium.webdriver.common.by import By
 
 
 class Download(object):
-	def __init__(self,urls=[],max_tasks=16):
+	def __init__(self,urls=[],max_tries=5,max_tasks=16):
 		self.urls = urls
 		self.headers = {}
 		self.max_tasks = max_tasks
-		self.max_tries = 5
+		self.max_tries = max_tries
 		self.new_loop = asyncio.new_event_loop()
 		self.loop = asyncio.get_event_loop()
 		self.session = aiohttp.ClientSession(loop=self.new_loop)
 		self.queue_done = asyncio.Queue(loop=self.new_loop)
+		self.queue_task = Queue()
 		self.total_chunk = 0  #下载总块数
 		self.total_size = 0 #文件总字节大小
 		self.done_chunk = 0   #下载完成块数
-		self.done_size = 0	
-		self.start_rate = False
-		self.start_event = False
+		self.done_size = 0		# 下载完成字节数
 		self.driver = None
+		self.rs = requests.session()
+		self.semaphore = asyncio.Semaphore(500)		 # 限制并发量为500,这里windows需要进行并发限制
+
+		# 配置文件初始化
 		self.cfg = RawConfigParser()
 		self.conf = download_dir+'/fastdawnload.conf'
 		if not os.path.exists(self.conf):
 			open(self.conf, 'a').close()
 		self.cfg.read(self.conf)
-		self.download_progress = {}
+
+		# 下载进度初始化
+		self.download_progress = {}	# 保存每一个下载任务
 		for section in self.cfg.sections():
-			if self.cfg.get(section,'success') == "0":
+			if self.cfg.get(section,'success') != "2":	# 1表示下载完成,2表示合并完成
 				self.download_progress[section] = {}
 				self.download_progress[section]['total'] = self.cfg.get(section,'total')
 				self.download_progress[section]['done'] = self.cfg.get(section,'done')
 				self.download_progress[section]['content_length'] = self.cfg.get(section,'content_length')
 				self.download_progress[section]['done_length'] = self.cfg.get(section,'done_length')
-		self.rs = requests.session()
 
-
-
-		self.sub_workers = []
-		self.start_thread()
-
-		self.check_ini(self.urls)
-		
-
-	def start_thread(self):
+		# 启动线程
 		t = threading.Thread(target=self.start_loop,args=(self.new_loop,))
-		t.setDaemon(True)    # 设置子线程为守护线程,即主线程退出时，子线程也会跟着退出
+		t.setDaemon(True)    # 设置子线程为守护线程,即主线程退出时，子线程也会跟着退出，否则主线程要等子线程结束才会退出
 		t.start()
 
+		# 开始运行
+		self.run()
+
 	def start_loop(self,loop):
+		'''为子线程设置事件循环'''
 		print('线程开启 tid:',threading.currentThread().ident)
 		asyncio.set_event_loop(loop)
 		loop.run_forever()
 
-	def check_ini(self,urls):
+	async def stop_loop(self):
+		'''子线程停止事件循环'''
+		print('线程关闭 tid:',threading.currentThread().ident)
+		await self.session.close()
+		self.new_loop.stop()
+
+	def check_data(self,urls):
+		'''检查下载文件'''
 		if urls:
-			self.check_url(urls)
+			rlt = self.check_url(urls)
 		else:	# 则下载ini中的
 			for section in self.cfg.sections():
-				if self.cfg.get(section,'success') == '0':
+				if self.cfg.get(section,'success') != '2':	# 继续下载
 					urls.append(unquote(self.cfg.get(section,'url')))
-			if not urls:
-				asyncio.run_coroutine_threadsafe(self.stop_loop(),self.new_loop)
-				self.loop.close()
-			self.check_url(urls)
+			rlt = self.check_url(urls)
+		return rlt
 
 	def check_url(self,urls):
-		'''返回队列和文件名或文件路径'''
+		'''检查文件下载地址'''
 		m3u_url = []
 		html_url = []
 		http_url = []
@@ -97,13 +102,151 @@ class Download(object):
 				html_url.append(url)
 			else:
 				http_url.append(url)
-		self.get_m3u_task(m3u_url)
-		self.get_html_task(html_url)
-		self.get_http_task(http_url)
+		result = self.create_tasks(m3u_url,http_url,html_url)
+		if result:
+			asyncio.run_coroutine_threadsafe(self.rate(),self.new_loop)	# 总进度
+		else:
+			asyncio.run_coroutine_threadsafe(self.stop_loop(),self.new_loop)	# 关闭session和事件循环
+		return result
 
-	async def stop_loop(self):
-		await self.session.close()
-		self.new_loop.stop()
+	def create_tasks(self,m3u,http,html):
+		'''创建下载任务'''
+		result = None
+		for url in m3u:
+			queue,section = self.producer_m3u(url)
+			asyncio.run_coroutine_threadsafe(self.run_tasks(queue,section,self.queue_task,self.semaphore),self.new_loop)
+			result = True
+		for url in http:
+			queue,section = self.producer_http(url)
+			asyncio.run_coroutine_threadsafe(self.run_tasks(queue,section,self.queue_task,self.semaphore),self.new_loop)
+			result = True
+		for url in html:
+			pass
+		return result
+
+	async def run_tasks(self,queue,section,q,semaphore):
+		'''将任务放在子线程中分发,并等待任务完成'''
+		print('task-start: %s, run in tid: %s '%(section,threading.currentThread().ident))
+		if queue and queue.qsize():
+			sub_workers = [asyncio.ensure_future(self.consumer(queue,semaphore)) for _ in range(self.max_tasks)]
+			#在协程内等待结果. 通过await 来交出控制权, 同时等待tasks完成
+			task_done,task_pending = await asyncio.wait(sub_workers)
+		
+		# 下载完成写入文件
+		self.cfg.set(section,'success',"1")
+		self.cfg.write(open(self.conf,'w'))
+
+		# 任务结束，发送消息
+		done = self.download_progress[section]['done']
+		total = self.download_progress[section]['total']
+		q.put('\ntask-end: {} | ({}/{}) {:.2%}'.format(section,done,total,done/total))
+
+		# 删除已下载结束的任务
+		self.download_progress.pop(section)
+
+		# 合并文件,合并完成写入文件
+		if done == total:	# 下载完成
+			q.put('Merge Files...')
+			file = await self.convert_m3u(section)
+			self.cfg.set(section,'success',"2")
+			self.cfg.write(open(self.conf,'w'))	# 合并完成写入文件
+			q.put('\nDownload complete：%s'%file)
+		else:
+			q.put('Download not complete !')
+
+		# 如果都下载完了，则设置为None
+		if self.download_progress == {}:
+			self.download_progress = None
+
+	async def consumer(self,queue,semaphore):
+		'''接收下载任务'''
+		async with semaphore:		#这里进行执行asyncio.Semaphore，
+			section = None
+			while True:
+				if queue.empty():
+					return section
+				try:
+					key = await queue.get()
+					key = await self.download(key)
+					if key:
+						self.done_chunk +=1		# 下载总完成kuai数增加
+						self.download_progress[key['section']]['done'] += 1	#当前文件下载块数增加
+					else:
+						print(key['file_name'],'下载失败\n')
+					section = key['section']
+					queue.task_done()   # 用来触发check_done
+				except asyncio.CancelledError:
+					raise
+				except Exception as e:
+					pass
+
+	async def download(self,key):
+		'''下载文件'''
+		# print(key)
+		if key['ftype'] == 'm3u8':
+			file_name = key['file_name']
+			file_path = key['save_path'] + '/' + key['file_name']
+			url = key['base_url'] + '/' + file_name
+			# print(key,url)
+			for i in range(self.max_tries):
+				try:
+					async with self.session.get(url,timeout=5) as resp:
+						async with aiofiles.open(file_path,'wb') as fd:
+							await fd.write(await resp.read())
+					self.done_size += os.path.getsize(file_path)	 #下载字节数增加
+					self.download_progress[key['section']]['done_length'] += os.path.getsize(file_path)
+					# print('下载完成%s'%key['file_name'])
+					return key
+				except asyncio.CancelledError:
+					print('error')
+					raise
+				except Exception as e:
+					# 会有下载失败的情况
+					pass
+			return False
+			
+		elif key['ftype'] == 'http':
+			file_name = key['file_name']
+			file_path = key['save_path'] + '/' + key['file_name']
+			url = key['url']
+
+			while True:
+				if key['Amount'] >= self.max_tries:
+					return False
+				try:
+					headers = {'Range': 'bytes=%s-%s'%(key['start'],key['end'])}
+					async with self.session.get(url,headers=headers,timeout=5) as resp:
+						async with aiofiles.open(file_path,'ab') as fd:
+							while True:
+								data = await resp.content.read(20480) 	#每次最多寫入20k
+								status = resp.status
+								if status not in (200,206):
+									key['Amount'] +=1
+									break
+								if not data:
+									break
+								await fd.write(data)
+								self.done_size += len(data)	# 下载总字节数增加
+								self.download_progress[key['section']]['done_length'] += len(data)	#下载字节数增加
+								
+				except asyncio.CancelledError:
+					# raise
+					break
+				except Exception as e:
+					# 会有下载失败的情况
+					# 下载失败，表示这块下载到一半就失败了，那么剩下的一半可以修改请求头，循环继续请求
+					# print('块下载失败')
+
+					if os.path.exists(file_path):
+						tmp_size = os.path.getsize(file_path)
+						if tmp_size > key['done']:		# 表示又下载了部分
+							key['start'] += tmp_size - key['done']	# 更新key['start']
+							key['done'] = tmp_size
+						else:
+							key['Amount'] +=1
+							
+				if os.path.exists(file_path) and os.path.getsize(file_path)>=key['size']:
+					return key
 
 	async def convert_m3u(self,section):
 		'''文件合并'''
@@ -160,7 +303,25 @@ class Download(object):
 					raise
 		return download_file
 
+	async def rate(self):
+		'''下载进度统计'''
+		# widgets = ['Progress: ', Percentage(), ' ', Bar(marker=RotatingMarker('#')),' ',SimpleProgress(),
+		#    ' ', ETA(), ' ', FileTransferSpeed()]
+		# pbar = ProgressBar(widgets=widgets, maxval=self.total).start()
+		pbar = ShowProcess(self.total_chunk)
+		while True:
+			if not self.total_chunk:
+				return
+			if self.download_progress != {} and self.download_progress != None:
+				rlt = pbar.show_process(self.done_chunk,self.done_size)
+				# pbar.update(self.done_chunk)
+				await asyncio.sleep(0.5)
+				continue
+			pbar.finish()
+			return
+
 	def producer_http(self,url):
+		'''检查要下载的网络文件'''
 		requests.packages.urllib3.disable_warnings()
 		r = self.rs.get(url,stream=True,verify=False)
 		url = r.url
@@ -283,8 +444,8 @@ class Download(object):
 		self.done_size += done_length
 		return queue,section
 	
-
 	def producer_m3u(self,url):
+		'''检查要下载的网络文件'''
 		queue = asyncio.Queue(loop=self.new_loop)
 		parsed_result = urlsplit(url)
 		scheme = parsed_result.scheme
@@ -375,8 +536,7 @@ class Download(object):
 				return queue,done,save_path
 		if not queue.qsize():
 			print('%-15s 下载完毕'%save_path.split('/')[-1])
-		else:
-			print('%-15s 准备下载...'%save_path.split('/')[-1])
+
 		total = done + queue.qsize()
 		self.cfg.set(section,'total',str(total))
 		self.cfg.set(section,'done',str(done))
@@ -388,170 +548,6 @@ class Download(object):
 		self.total_size += 0
 		self.done_size += 0
 		return queue,section
-
-	async def consumer(self,queue,semaphore):
-		async with semaphore:		#这里进行执行asyncio.Semaphore，
-			section = None
-			while True:
-				if queue.empty():
-					return section
-				try:
-					key = await queue.get()
-					key = await self.download(key)
-					if key:
-						self.done_chunk +=1		# 下载总完成kuai数增加
-						self.download_progress[key['section']]['done'] += 1	#当前文件下载块数增加
-					else:
-						print(key['file_name'],'下载失败\n')
-					section = key['section']
-					queue.task_done()   # 用来触发check_done
-				except asyncio.CancelledError:
-					raise
-				except Exception as e:
-					pass
-
-	async def download(self,key):
-		'''返回文件大小和文件路径'''
-		# print(key)
-		if key['ftype'] == 'm3u8':
-			file_name = key['file_name']
-			file_path = key['save_path'] + '/' + key['file_name']
-			url = key['base_url'] + '/' + file_name
-			# print(key,url)
-			for i in range(self.max_tries):
-				try:
-					async with self.session.get(url,timeout=5) as resp:
-						async with aiofiles.open(file_path,'wb') as fd:
-							await fd.write(await resp.read())
-					self.done_size += os.path.getsize(file_path)	 #下载字节数增加
-					self.download_progress[key['section']]['done_length'] += os.path.getsize(file_path)
-					# print('下载完成%s'%key['file_name'])
-					return key
-				except asyncio.CancelledError:
-					print('error')
-					raise
-				except Exception as e:
-					# 会有下载失败的情况
-					pass
-			return False
-			
-		elif key['ftype'] == 'http':
-			file_name = key['file_name']
-			file_path = key['save_path'] + '/' + key['file_name']
-			url = key['url']
-
-			while True:
-				if key['Amount'] >= self.max_tries:
-					return False
-				try:
-					headers = {'Range': 'bytes=%s-%s'%(key['start'],key['end'])}
-					async with self.session.get(url,headers=headers,timeout=5) as resp:
-						async with aiofiles.open(file_path,'ab') as fd:
-							while True:
-								data = await resp.content.read(20480) 	#每次最多寫入20k
-								status = resp.status
-								if status not in (200,206):
-									key['Amount'] +=1
-									break
-								if not data:
-									break
-								await fd.write(data)
-								self.done_size += len(data)	# 下载总字节数增加
-								self.download_progress[key['section']]['done_length'] += len(data)	#下载字节数增加
-								
-				except asyncio.CancelledError:
-					# raise
-					break
-				except Exception as e:
-					# 会有下载失败的情况
-					# 下载失败，表示这块下载到一半就失败了，那么剩下的一半可以修改请求头，循环继续请求
-					# print('块下载失败')
-
-					if os.path.exists(file_path):
-						tmp_size = os.path.getsize(file_path)
-						if tmp_size > key['done']:		# 表示又下载了部分
-							key['start'] += tmp_size - key['done']	# 更新key['start']
-							key['done'] = tmp_size
-						else:
-							key['Amount'] +=1
-							
-				if os.path.exists(file_path) and os.path.getsize(file_path)>=key['size']:
-					return key
-		
-	async def check_done(self,queue,section):
-		'''下载完成发消息'''
-		try:
-			await queue.join()
-			path = self.cfg.get(section,'save_path') + '/' + self.cfg.get(section,'name')
-			msg = '\r任务结束：{:<15s} | ({}/{}) {:.2%}'.format(path,self.download_progress[section]['done'],self.download_progress[section]['total'],self.download_progress[section]['done']/self.download_progress[section]['total'])
-			self.queue_done.put_nowait(msg)
-			if self.download_progress[section]['done'] == self.download_progress[section]['total']:	# 下载完成
-				self.cfg.set(section,'success',"1")
-				self.cfg.write(open(self.conf,'w'))	# 下载完成写入文件
-				self.queue_done.put_nowait('合并文件...')
-				file = await self.convert_m3u(section)
-				self.queue_done.put_nowait('生成文件：%s'%file)
-			else:
-				self.queue_done.put_nowait('未下载完成')
-		except asyncio.CancelledError:
-			raise
-		except Exception:
-			print('err')
-			raise
-			pass
-		self.download_progress.pop(section)	# 删除已下载结束的renwu
-
-	async def rate(self):
-		'''下载进度统计'''
-		# widgets = ['Progress: ', Percentage(), ' ', Bar(marker=RotatingMarker('#')),' ',SimpleProgress(),
-		#    ' ', ETA(), ' ', FileTransferSpeed()]
-		# pbar = ProgressBar(widgets=widgets, maxval=self.total).start()
-		pbar = ShowProcess(self.total_chunk)
-		try:
-			while True:
-				if not self.total_chunk:
-					break
-				rlt = pbar.show_process(self.done_chunk,self.done_size)
-				# rlt = pbar.show_processes(self.download_progress)
-				if rlt:
-					break
-				# pbar.update(self.done_chunk)
-				if self.download_progress:
-					await asyncio.sleep(2)
-					continue
-				# pbar.finish()
-				# await asyncio.sleep(10)
-				# 序列为空则说明文件下载完毕了，输出文件下载情况
-				for _ in range(self.queue_done.qsize()):
-					print(await self.queue_done.get())
-				return
-		except asyncio.CancelledError:
-			raise
-		except Exception:
-			pass
-
-	async def get_result(self,future):
-		result = future.result()
-		section = result
-		try:
-			path = self.cfg.get(section,'save_path') + '/' + self.cfg.get(section,'name')
-			msg = '\r任务结束：{:<15s} | ({}/{}) {:.2%}'.format(path,self.download_progress[section]['done'],self.download_progress[section]['total'],self.download_progress[section]['done']/self.download_progress[section]['total'])
-			self.queue_done.put_nowait(msg)
-			if self.download_progress[section]['done'] == self.download_progress[section]['total']:	# 下载完成
-				self.cfg.set(section,'success',"1")
-				self.cfg.write(open(self.conf,'w'))	# 下载完成写入文件
-				self.queue_done.put_nowait('合并文件...')
-				file = await self.convert_m3u(section)
-				self.queue_done.put_nowait('生成文件：%s'%file)
-			else:
-				self.queue_done.put_nowait('未下载完成')
-		except asyncio.CancelledError:
-			raise
-		except Exception:
-			print('err')
-			raise
-			pass
-		self.download_progress.pop(section)	# 删除已下载结束的renwu
 
 	def get_html_task(self,urls):
 		if not urls:
@@ -578,69 +574,19 @@ class Download(object):
 			for param in params:
 				print(param)
 
-	def get_http_task(self,urls):
-		semaphore = asyncio.Semaphore(500)		 # 限制并发量为500,这里windows需要进行并发限制
-		if not urls:
-			return
-		sub_workers=[]
-		for url in urls:
-			queue,section = self.producer_http(url)
-			if queue and queue.qsize():
-				sub_workers +=[asyncio.run_coroutine_threadsafe(self.consumer(queue,semaphore),self.new_loop) for _ in range(self.max_tasks)]
-				sub_workers.append(asyncio.run_coroutine_threadsafe(self.check_done(queue,section),self.new_loop))
-		if not self.start_rate:
-			sub_workers.append(asyncio.run_coroutine_threadsafe(self.rate(),self.new_loop)) # 总进度
-			self.start_rate = True
-		self.sub_workers += [asyncio.wrap_future(worker,loop=self.loop) for worker in sub_workers]
-
-		self.run()
-
-	def get_m3u_task(self,urls):
-		semaphore = asyncio.Semaphore(500)		 # 限制并发量为500,这里windows需要进行并发限制
-		if not urls:
-			return
-		sub_workers = []
-		for url in urls:
-			queue,section = self.producer_m3u(url)
-			if queue and queue.qsize():
-				sub_workers += [asyncio.run_coroutine_threadsafe(self.consumer(queue,semaphore),self.new_loop) for _ in range(self.max_tasks)]
-				# for _ in range(self.max_tasks):
-				# 	 task = asyncio.run_coroutine_threadsafe(self.consumer(queue,semaphore),self.new_loop)
-				# 	 task.add_done_callback(self.get_result)
-				# 	 sub_workers.append(task)
-				sub_workers.append(asyncio.run_coroutine_threadsafe(self.check_done(queue,section),self.new_loop))
-		if not self.start_rate:
-			sub_workers.append(asyncio.run_coroutine_threadsafe(self.rate(),self.new_loop)) # 总进度
-			self.start_rate = True
-		self.sub_workers += [asyncio.wrap_future(worker,loop=self.loop) for worker in sub_workers]
-
-		self.run()
-
 	def run(self):
-
-		if self.start_event:
-			return
-		self.start_event = True
-		try:
-			self.loop.run_until_complete(asyncio.wait(self.sub_workers)) #等待协程执行完成
-			# 因为协程已经自动关闭了，所以不用手动关闭协程了
-			# for worker in sub_workers:
-			#	 print(worker)
-				# worker.cancel()
-		except asyncio.CancelledError:
-			print('CancelledError shuc')
-			raise
-		except KeyboardInterrupt as e:
-			raise
-			# for worker in sub_workers:
-			#	 worker.cancel()
-			print(e)
-		except Exception as e:
-			print(e)
-
-		# 关闭session和事件循环,已经主线程的事件循环
-		asyncio.run_coroutine_threadsafe(self.stop_loop(),self.new_loop)
-		self.loop.close()
+		result = self.check_data(self.urls)
+		while result:
+			try:
+				x = self.queue_task.get(timeout=0.5)
+				print('%s'%x)
+			except KeyboardInterrupt as e:
+				print('按下：ctrl+c')
+				return
+			except Exception as e:
+				if self.download_progress == None:	# 任务完成
+					return
+				pass
 
 class ShowProcess():
 	"""
@@ -656,6 +602,7 @@ class ShowProcess():
 		self.i = 0
 		self.infoDone = infoDone
 		self.size = 0
+		self.speed = 0
 		self.start_time = time.time()
 		self.total = 0
 		self.done = 0
@@ -664,17 +611,19 @@ class ShowProcess():
 	# 效果为[>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>]100.00%
 	def show_process(self, i=None,size=0):
 		if self.i >= self.max_steps:
-			return self.finish()
+			return True
 		end_time = time.time()
 		if i is not None:
 			self.i = i
 		else:
 			self.i += 1
 		try:
-			speed = (size - self.size)/(end_time - self.start_time)
+			if size == self.size:
+				return
+			self.speed = (size - self.size)/(end_time - self.start_time)
 		except:
-			speed = 0
-		speed_str = " Speed: %-12s"%self.format_size(speed)
+			self.speed = 0
+		speed_str = " Speed: %-12s"%self.format_size(self.speed)
 		self.size = size
 		self.start_time = end_time
 		num_arrow = int(self.i * self.max_arrow / self.max_steps) #计算显示多少个'#'
@@ -726,13 +675,10 @@ class ShowProcess():
 			return "%.2fKb/s"%kb
 
 	def finish(self):
-		print('\n\n')
+		# print('\n')
 		# print(self.infoDone)
 		self.i = 0
 		return True
-
-
-
 
 if __name__ == '__main__':
 	loop = asyncio.get_event_loop()
