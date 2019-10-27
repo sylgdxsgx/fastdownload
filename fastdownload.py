@@ -27,9 +27,9 @@ class Download(object):
 		self.max_tasks = max_tasks
 		self.max_tries = max_tries
 		self.new_loop = asyncio.new_event_loop()
-		self.loop = asyncio.get_event_loop()
+		# self.loop = asyncio.get_event_loop()
 		self.session = aiohttp.ClientSession(loop=self.new_loop)
-		self.queue_done = asyncio.Queue(loop=self.new_loop)
+		# self.queue_done = asyncio.Queue(loop=self.new_loop)
 		self.queue_task = Queue()
 		self.total_chunk = 0  #下载总块数
 		self.total_size = 0 #文件总字节大小
