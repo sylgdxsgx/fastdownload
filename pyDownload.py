@@ -101,18 +101,18 @@ class Download(object):
 		for url in m3u:
 			queue,section = self.producer_m3u(url)
 			if section:	# section存在时才会更新下载
-				asyncio.run_coroutine_threadsafe(self.create_tasks(queue,section,self.queue_task,self.semaphore),self.new_loop)
+				asyncio.run_coroutine_threadsafe(self.distribute_task(queue,section,self.queue_task,self.semaphore),self.new_loop)
 				result = True
 		for url in http:
 			queue,section = self.producer_http(url)
 			if section:
-				asyncio.run_coroutine_threadsafe(self.create_tasks(queue,section,self.queue_task,self.semaphore),self.new_loop)
+				asyncio.run_coroutine_threadsafe(self.distribute_task(queue,section,self.queue_task,self.semaphore),self.new_loop)
 				result = True
 		for url in html:
 			pass
 		return result
 
-	async def create_tasks(self,queue,section,q,semaphore):
+	async def distribute_task(self,queue,section,q,semaphore):
 		'''将任务放在子线程中分发,并等待任务完成'''
 		print('task-start: %s, run in tid: %s '%(section,threading.currentThread().ident))
 		if queue and queue.qsize():	# 如果有队列任务则创建，没有则更新下载状态
@@ -646,5 +646,4 @@ class ShowProcess():
 		return True
 
 if __name__ == '__main__':
-	loop = asyncio.get_event_loop()
 	Dl = Download(urls=sys.argv[1:])
