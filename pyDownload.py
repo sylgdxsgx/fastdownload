@@ -5,23 +5,13 @@ from progressbar import *
 from queue import Queue
 from urllib.parse import urlsplit,unquote,quote
 from configparser import RawConfigParser
-from bs4 import BeautifulSoup
 
- 
+# 设置缓存目录
 download_dir = os.path.expanduser('~/AppData/Roaming/myDownload')
 os.makedirs(download_dir,exist_ok=True)
 
-# from selenium import webdriver
-# from selenium.webdriver.Chrome.options import Options
-from selenium.webdriver import Chrome
-from selenium.webdriver import ChromeOptions
-from selenium.webdriver.support.wait import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.by import By
-
-
 class Download(object):
-	def __init__(self,urls=[],max_tries=5,max_tasks=16):
+	def __init__(self,urls=[],max_tries=5,max_tasks=32):
 		self.urls = urls
 		self.headers = {}
 		self.max_tasks = max_tasks
@@ -30,12 +20,13 @@ class Download(object):
 		# self.loop = asyncio.get_event_loop()
 		self.session = aiohttp.ClientSession(loop=self.new_loop)
 		# self.queue_done = asyncio.Queue(loop=self.new_loop)
-		self.queue_task = Queue()
+		self.queue_task = Queue() 	# 每个任务的下载消息
+
 		self.total_chunk = 0  #下载总块数
 		self.total_size = 0 #文件总字节大小
 		self.done_chunk = 0   #下载完成块数
 		self.done_size = 0		# 下载完成字节数
-		self.driver = None
+
 		self.rs = requests.session()
 		self.semaphore = asyncio.Semaphore(500)		 # 限制并发量为500,这里windows需要进行并发限制
 
@@ -52,7 +43,8 @@ class Download(object):
 			if self.cfg.get(section,'success') != "2":	# 1表示下载完成,2表示合并完成
 				self.download_progress[section] = {}
 				self.download_progress[section]['total'] = self.cfg.get(section,'total')
-				self.download_progress[section]['done'] = self.cfg.get(section,'done')
+				self.download_progress[section]['done'] = 0
+				self.download_progress[section]['fail'] = 0
 				self.download_progress[section]['content_length'] = self.cfg.get(section,'content_length')
 				self.download_progress[section]['done_length'] = self.cfg.get(section,'done_length')
 
@@ -66,34 +58,27 @@ class Download(object):
 
 	def start_loop(self,loop):
 		'''为子线程设置事件循环'''
-		print('线程开启 tid:',threading.currentThread().ident)
+		print('开启子线程 tid:',threading.currentThread().ident)
 		asyncio.set_event_loop(loop)
 		loop.run_forever()
 
 	async def stop_loop(self):
 		'''子线程停止事件循环'''
-		print('线程关闭 tid:',threading.currentThread().ident)
+		print('关闭子线程 tid:',threading.currentThread().ident)
 		await self.session.close()
 		self.new_loop.stop()
 
-	def check_data(self,urls):
-		'''检查下载文件'''
-		if urls:
-			rlt = self.check_url(urls)
-		else:	# 则下载ini中的
+	def check_url(self,urls):
+		'''检查文件下载地址'''
+		if not urls:	# 如果没有下载链接
 			for section in self.cfg.sections():
 				if self.cfg.get(section,'success') != '2':	# 继续下载
 					urls.append(unquote(self.cfg.get(section,'url')))
-			rlt = self.check_url(urls)
-		return rlt
-
-	def check_url(self,urls):
-		'''检查文件下载地址'''
+		# 检查下载地址
 		m3u_url = []
 		html_url = []
 		http_url = []
-		for url in urls:
-			url = unquote(url)
+		for url in urls:	# url分类
 			parsed_result = urlsplit(url)
 			file = os.path.split(parsed_result.path)[1]
 			if file == 'index.m3u8':
@@ -102,36 +87,40 @@ class Download(object):
 				html_url.append(url)
 			else:
 				http_url.append(url)
-		result = self.create_tasks(m3u_url,http_url,html_url)
+		# 检查下载任务
+		result = self.check_tasks(m3u_url,http_url,html_url)
 		if result:
 			asyncio.run_coroutine_threadsafe(self.rate(),self.new_loop)	# 总进度
 		else:
 			asyncio.run_coroutine_threadsafe(self.stop_loop(),self.new_loop)	# 关闭session和事件循环
 		return result
 
-	def create_tasks(self,m3u,http,html):
-		'''创建下载任务'''
+	def check_tasks(self,m3u,http,html):
+		'''检查下载任务'''
 		result = None
 		for url in m3u:
 			queue,section = self.producer_m3u(url)
-			asyncio.run_coroutine_threadsafe(self.run_tasks(queue,section,self.queue_task,self.semaphore),self.new_loop)
-			result = True
+			if section:	# section存在时才会更新下载
+				asyncio.run_coroutine_threadsafe(self.create_tasks(queue,section,self.queue_task,self.semaphore),self.new_loop)
+				result = True
 		for url in http:
 			queue,section = self.producer_http(url)
-			asyncio.run_coroutine_threadsafe(self.run_tasks(queue,section,self.queue_task,self.semaphore),self.new_loop)
-			result = True
+			if section:
+				asyncio.run_coroutine_threadsafe(self.create_tasks(queue,section,self.queue_task,self.semaphore),self.new_loop)
+				result = True
 		for url in html:
 			pass
 		return result
 
-	async def run_tasks(self,queue,section,q,semaphore):
+	async def create_tasks(self,queue,section,q,semaphore):
 		'''将任务放在子线程中分发,并等待任务完成'''
 		print('task-start: %s, run in tid: %s '%(section,threading.currentThread().ident))
-		if queue and queue.qsize():
+		if queue and queue.qsize():	# 如果有队列任务则创建，没有则更新下载状态
 			sub_workers = [asyncio.ensure_future(self.consumer(queue,semaphore)) for _ in range(self.max_tasks)]
 			#在协程内等待结果. 通过await 来交出控制权, 同时等待tasks完成
 			task_done,task_pending = await asyncio.wait(sub_workers)
 		
+		# 更新下载状态
 		# 下载完成写入文件
 		self.cfg.set(section,'success',"1")
 		self.cfg.write(open(self.conf,'w'))
@@ -152,7 +141,7 @@ class Download(object):
 			self.cfg.write(open(self.conf,'w'))	# 合并完成写入文件
 			q.put('\nDownload complete：%s'%file)
 		else:
-			q.put('Download not complete !')
+			q.put('Download Fail ! download_length: %s Content_Length: %s'%(done,total))
 
 		# 如果都下载完了，则设置为None
 		if self.download_progress == {}:
@@ -161,20 +150,19 @@ class Download(object):
 	async def consumer(self,queue,semaphore):
 		'''接收下载任务'''
 		async with semaphore:		#这里进行执行asyncio.Semaphore，
-			section = None
 			while True:
 				if queue.empty():
-					return section
+					return
 				try:
-					key = await queue.get()
-					key = await self.download(key)
-					if key:
+					key = await queue.get()	# 获取下载任务
+					status,key = await self.download(key)
+					if status:
 						self.done_chunk +=1		# 下载总完成kuai数增加
 						self.download_progress[key['section']]['done'] += 1	#当前文件下载块数增加
 					else:
-						print(key['file_name'],'下载失败\n')
-					section = key['section']
-					queue.task_done()   # 用来触发check_done
+						self.download_progress[key['section']]['fail'] +=1	# 失败数+1
+						if self.download_progress[key['section']]['fail'] < self.download_progress[key['section']]['done']:
+							queue.put_nowait(key)
 				except asyncio.CancelledError:
 					raise
 				except Exception as e:
@@ -187,7 +175,6 @@ class Download(object):
 			file_name = key['file_name']
 			file_path = key['save_path'] + '/' + key['file_name']
 			url = key['base_url'] + '/' + file_name
-			# print(key,url)
 			for i in range(self.max_tries):
 				try:
 					async with self.session.get(url,timeout=5) as resp:
@@ -195,26 +182,23 @@ class Download(object):
 							await fd.write(await resp.read())
 					self.done_size += os.path.getsize(file_path)	 #下载字节数增加
 					self.download_progress[key['section']]['done_length'] += os.path.getsize(file_path)
-					# print('下载完成%s'%key['file_name'])
-					return key
+					return True,key
 				except asyncio.CancelledError:
 					print('error')
-					raise
+					break
 				except Exception as e:
 					# 会有下载失败的情况
 					pass
-			return False
+			return False,key
 			
 		elif key['ftype'] == 'http':
 			file_name = key['file_name']
 			file_path = key['save_path'] + '/' + key['file_name']
 			url = key['url']
 
-			while True:
-				if key['Amount'] >= self.max_tries:
-					return False
+			while key['Amount'] < self.max_tries:
 				try:
-					headers = {'Range': 'bytes=%s-%s'%(key['start'],key['end'])}
+					headers = {'Range': 'bytes=%s-%s'%(key['begin'],key['end'])}
 					async with self.session.get(url,headers=headers,timeout=5) as resp:
 						async with aiofiles.open(file_path,'ab') as fd:
 							while True:
@@ -239,14 +223,15 @@ class Download(object):
 
 					if os.path.exists(file_path):
 						tmp_size = os.path.getsize(file_path)
-						if tmp_size > key['done']:		# 表示又下载了部分
-							key['start'] += tmp_size - key['done']	# 更新key['start']
-							key['done'] = tmp_size
+						if tmp_size > key['begin'] - key['start']:		# 表示又下载了部分
+							key['begin'] = key['start'] + tmp_size	# 更新key['begin']
 						else:
 							key['Amount'] +=1
 							
 				if os.path.exists(file_path) and os.path.getsize(file_path)>=key['size']:
-					return key
+					return True,key
+			key['Amount'] = 0	# 重置失败次数
+			return False,key
 
 	async def convert_m3u(self,section):
 		'''文件合并'''
@@ -301,6 +286,13 @@ class Download(object):
 								await video.write(await f.read()) 
 				except Exception as e:
 					raise
+		# 删除缓存文件
+		for root,dirs,files in os.walk(path):
+			for file in files:
+				os.remove(os.path.join(root,file))
+			for d in dirs:
+				os.rmdir(os.path.join(root,d))
+		os.rmdir(path)
 		return download_file
 
 	async def rate(self):
@@ -342,7 +334,7 @@ class Download(object):
 				r = self.rs.get(url,headers=headers,stream=True,verify=False)
 			except:		# 仍然请求失败
 				print('不支持断点续传')
-				return False
+				return False,None
 
 		# 文件保存路径
 		parsed_result = urlsplit(url)
@@ -360,13 +352,13 @@ class Download(object):
 				url = unquote(self.cfg.get(tmp_section,'url'))
 				Content_Length = int(self.cfg.get(tmp_section,'Content_Length'))
 				save_path = self.cfg.get(tmp_section,'save_path')
-				per_size = int(self.cfg.get(tmp_section,'per_size'))
+				per_size = int(self.cfg.get(tmp_section,'per_size'))	# 一定要使用该值，不能每次计算
 				break
 
 		# 未记录，拆解文件
 		if not section:
 			# 支持断点续传方法一
-			if Content_Length < 1024*1024*200:	# 小于200M
+			if Content_Length <= 1024*1024*200:	# 小于200M
 				per_size = round(Content_Length/self.max_tasks)
 			elif Content_Length <= 1024*1024*1024: 	# 小于1G
 				per_size = 1024*1024*5
@@ -380,7 +372,7 @@ class Download(object):
 			self.cfg.add_section(time_stamp)
 			self.cfg.set(time_stamp,'success',str(0))
 			self.cfg.set(time_stamp,'total',str(0))
-			self.cfg.set(time_stamp,'done',str(0))
+			# self.cfg.set(time_stamp,'done',str(0))
 			self.cfg.set(time_stamp,'url',quote(url))
 			self.cfg.set(time_stamp,'protocol',scheme)
 			self.cfg.set(time_stamp,'name',file_name)
@@ -395,49 +387,45 @@ class Download(object):
 			os.makedirs(save_path,exist_ok=True)
 
 		# 保存到队列
-		done = 0
-		done_length = 0
+		done = 0			# 保存已经下载的块数
+		done_length = 0		# 保存已经下载的字节数
 		start_byte = 0
 		queue = asyncio.Queue(loop=self.new_loop)
 		while start_byte<Content_Length:
+			# 获取片段
+			tmp_start = start_byte	# 块的开始字节
+			tmp_begin = tmp_start	# 块从这个字节开始下载
 			next_byte = start_byte+per_size
-			if next_byte < Content_Length:
-				if round((Content_Length-next_byte+1)/per_size):
-					tmp_start = start_byte
-					tmp_end = next_byte-1
-					tmp_size = next_byte - start_byte
-					tmp_done = 0
-				else:
-					tmp_start = start_byte
-					tmp_end = ''
-					tmp_size = Content_Length - start_byte +1
-					tmp_done = 0
-					next_byte = Content_Length
-			else:
-				tmp_start = start_byte
-				tmp_end = ''
-				tmp_size = Content_Length - start_byte +1
-				tmp_done = 0
 
-			# 判断文件是否下载完成
+			if round((Content_Length-next_byte+1)/per_size):
+				tmp_end = start_byte + per_size -1
+				tmp_size = per_size
+			else:
+				tmp_end = ''
+				tmp_size = Content_Length - start_byte
+				next_byte = Content_Length
+			# 文件存在且下载完成时
 			chunk_file = save_path+'/'+str(start_byte)
 			if os.path.exists(chunk_file) and os.path.getsize(chunk_file)>=tmp_size:	#要大于
 				done += 1
 				done_length += os.path.getsize(chunk_file)
 				start_byte = next_byte
 				continue
+			# 文件存在但未下载完成时
 			if os.path.exists(chunk_file):	# 如果未下载完成，则修改请求头继续下载
 				tmp_done = os.path.getsize(chunk_file)
 				done_length += tmp_done
-				tmp_start = tmp_start + tmp_done
-			queue.put_nowait({'section':section,'ftype':'http','file_name':str(start_byte),'save_path':save_path,'url':url,'start':tmp_start,'end':tmp_end,'done':tmp_done,'size':tmp_size,'Amount':0})
+				tmp_begin = tmp_start + tmp_done	# 修改下载起点
+			queue.put_nowait({'section':section,'ftype':'http','file_name':str(start_byte),
+				'save_path':save_path,'url':url,'start':tmp_start,'end':tmp_end,
+				'begin':tmp_begin,'size':tmp_size,'Amount':0})	# Amount用来保存下载失败次数
 			start_byte = next_byte
-		total = done+queue.qsize()
+		total = done+queue.qsize()	# 总块数
 		self.cfg.set(section,'total',str(total))
 		self.cfg.set(section,'done',str(done))
 		self.cfg.set(section,'done_length',str(done_length))
 		self.cfg.write(open(self.conf,'w'))
-		self.download_progress[section] = {'total':total,'done':done,'content_length':Content_Length,'done_length':done_length}
+		self.download_progress[section] = {'total':total,'done':done,'fail':0,'content_length':Content_Length,'done_length':done_length}
 		self.total_chunk += total
 		self.done_chunk += done
 		self.total_size += Content_Length
@@ -508,7 +496,7 @@ class Download(object):
 						self.cfg.add_section(time_stamp)
 						self.cfg.set(time_stamp,'success',str(0))
 						self.cfg.set(time_stamp,'total',str(0))
-						self.cfg.set(time_stamp,'done',str(0))
+						# self.cfg.set(time_stamp,'done',str(0))
 						self.cfg.set(time_stamp,'url',quote(url))
 						self.cfg.set(time_stamp,'protocol',scheme)
 						self.cfg.set(time_stamp,'name',file_name)
@@ -533,7 +521,7 @@ class Download(object):
 					pass
 			else:
 				print('%-15s 下载失败'%save_path.split('/')[-1])
-				return queue,done,save_path
+				return queue,None
 		if not queue.qsize():
 			print('%-15s 下载完毕'%save_path.split('/')[-1])
 
@@ -542,7 +530,7 @@ class Download(object):
 		self.cfg.set(section,'done',str(done))
 		self.cfg.set(section,'done_length',str(0))
 		self.cfg.write(open(self.conf,'w'))
-		self.download_progress[section] = {'total':total,'done':done,'content_length':0,'done_length':0}
+		self.download_progress[section] = {'total':total,'done':done,'fail':0,'content_length':0,'done_length':0}
 		self.total_chunk += total		 # 下载总数增加
 		self.done_chunk += done 	# 初始化总完成数量
 		self.total_size += 0
@@ -550,43 +538,20 @@ class Download(object):
 		return queue,section
 
 	def get_html_task(self,urls):
-		if not urls:
-			return
-		if not self.driver:
-			option = ChromeOptions()
-			option.add_argument('--headless')
-			self.driver = Chrome(chrome_options=option)
-		for url in urls:
-			print('start selenium')
-			self.driver.get(url)
-			tag = (By.ID,"playerBox")
-			WebDriverWait(self.driver,30,0.5).until(EC.element_to_be_clickable(tag)) 
-			soup = BeautifulSoup(self.driver.page_source,'lxml')
-			self.driver.close()
-			print('end selenium')
-			video = soup.find('div',class_='video-detail')
-			video_name = video.find('div',class_='video-name').h3.string
-			print(video_name)
-			# video_frame = video[0].find_all('div',class_='video-frame')
-			# print(video_frame)
-			param = video.find('embed')['flashvars']
-			params = urllib.unquote(param).split('&')
-			for param in params:
-				print(param)
+		pass
 
 	def run(self):
-		result = self.check_data(self.urls)
+		result = self.check_url(self.urls)
 		while result:
 			try:
 				x = self.queue_task.get(timeout=0.5)
-				print('%s'%x)
+				print('%s'%x) 
 			except KeyboardInterrupt as e:
-				print('按下：ctrl+c')
+				print('KeyboardInterrupt')
 				return
 			except Exception as e:
 				if self.download_progress == None:	# 任务完成
 					return
-				pass
 
 class ShowProcess():
 	"""
